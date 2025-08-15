@@ -205,7 +205,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// not-ready condition is managed here instead of in ensureMQ to distinguish between Error (when receiving)
 	// an error, or Running when transportURL is empty.
 	//
-	transportURL, op, err := r.ensureMQ(ctx, instance, helper, serviceLabels)
+	transportURL, op, quorumQueues, err := r.ensureMQ(ctx, instance, helper, serviceLabels)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			watcherv1beta1.WatcherRabbitMQTransportURLReadyCondition,
@@ -300,7 +300,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	// End of Prometheus config secret
 
-	subLevelSecretName, err := r.createSubLevelSecret(ctx, helper, instance, transporturlSecret, inputSecret, db)
+	subLevelSecretName, err := r.createSubLevelSecret(ctx, helper, instance, transporturlSecret, inputSecret, db, quorumQueues)
 	if err != nil {
 		return ctrl.Result{}, nil
 	}
@@ -321,7 +321,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// Generate config for dbsync
 	configVars := make(map[string]env.Setter)
 
-	err = r.generateServiceConfigDBJobs(ctx, instance, db, &transporturlSecret, helper, &configVars)
+	err = r.generateServiceConfigDBJobs(ctx, instance, db, quorumQueues, &transporturlSecret, helper, &configVars)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -606,7 +606,7 @@ func (r *WatcherReconciler) ensureMQ(
 	instance *watcherv1beta1.Watcher,
 	h *helper.Helper,
 	serviceLabels map[string]string,
-) (*rabbitmqv1.TransportURL, controllerutil.OperationResult, error) {
+) (*rabbitmqv1.TransportURL, controllerutil.OperationResult, bool, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Reconciling the RabbitMQ TransportURL for '%s'", instance.Name))
 
@@ -626,7 +626,7 @@ func (r *WatcherReconciler) ensureMQ(
 	})
 
 	if err != nil && !k8s_errors.IsNotFound(err) {
-		return nil, op, util.WrapErrorForObject(
+		return nil, op, false, util.WrapErrorForObject(
 			fmt.Sprintf("Error create or update TransportURL object %s-watcher-transport", instance.Name),
 			transportURL,
 			err,
@@ -640,24 +640,24 @@ func (r *WatcherReconciler) ensureMQ(
 	// If transportURL is not ready, it returns nil
 	if !transportURL.IsReady() || transportURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
-		return nil, op, nil
+		return nil, op, false, nil
 	}
 
 	secretName := types.NamespacedName{Namespace: instance.Namespace, Name: transportURL.Status.SecretName}
 	secret := &corev1.Secret{}
 	err = h.GetClient().Get(ctx, secretName, secret)
 	if err != nil {
-		return nil, op, err
+		return nil, op, false, err
 	}
 
 	_, ok := secret.Data[TransportURLSelector]
 	if !ok {
-		return nil, op, fmt.Errorf(
+		return nil, op, false, fmt.Errorf(
 			"the TransportURL secret %s does not have 'transport_url' field", transportURL.Status.SecretName)
 	}
 
 	instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherRabbitMQTransportURLReadyCondition, watcherv1beta1.WatcherRabbitMQTransportURLReadyMessage)
-	return transportURL, op, nil
+	return transportURL, op, transportURL.GetQuorumQueues(), nil
 }
 
 func (r *WatcherReconciler) ensureKeystoneSvc(
@@ -718,6 +718,7 @@ func (r *WatcherReconciler) generateServiceConfigDBJobs(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	db *mariadbv1.Database,
+	quorumQueues bool,
 	transporturlSecret *corev1.Secret,
 	helper *helper.Helper,
 	envVars *map[string]env.Setter,
@@ -746,6 +747,7 @@ func (r *WatcherReconciler) generateServiceConfigDBJobs(
 			watcher.DatabaseName,
 		),
 		"TransportURL":  string(transporturlSecret.Data[TransportURLSelector]),
+		"QuorumQueues":  quorumQueues,
 		"LogFile":       fmt.Sprintf("%s%s.log", watcher.WatcherLogPath, instance.Name),
 		"APIPublicPort": fmt.Sprintf("%d", watcher.WatcherPublicPort),
 	}
@@ -812,6 +814,7 @@ func (r *WatcherReconciler) createSubLevelSecret(
 	transportURLSecret corev1.Secret,
 	inputSecret corev1.Secret,
 	db *mariadbv1.Database,
+	quorumQueues bool,
 ) (string, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating SubCr Level Secret for '%s'", instance.Name))
@@ -820,6 +823,7 @@ func (r *WatcherReconciler) createSubLevelSecret(
 	data := map[string]string{
 		*instance.Spec.PasswordSelectors.Service: string(inputSecret.Data[*instance.Spec.PasswordSelectors.Service]),
 		TransportURLSelector:                     string(transportURLSecret.Data[TransportURLSelector]),
+		QuorumQueuesSelector:                     fmt.Sprintf("%t", quorumQueues),
 		DatabaseAccount:                          databaseAccount.Name,
 		DatabaseUsername:                         databaseAccount.Spec.UserName,
 		DatabasePassword:                         string(databaseSecret.Data[mariadbv1.DatabasePasswordSelector]),

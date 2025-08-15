@@ -168,6 +168,7 @@ func (r *WatcherAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		[]string{
 			*instance.Spec.PasswordSelectors.Service,
 			TransportURLSelector,
+			QuorumQueuesSelector,
 			DatabaseAccount,
 			DatabaseUsername,
 			DatabaseHostname,
@@ -444,6 +445,7 @@ func (r *WatcherAPIReconciler) generateServiceConfigs(
 	if instance.Spec.TLS.CaBundleSecretName != "" {
 		CaFilePath = tls.DownstreamTLSCABundlePath
 	}
+
 	templateParameters := map[string]interface{}{
 		"DatabaseConnection": fmt.Sprintf("mysql+pymysql://%s:%s@%s/%s?read_default_file=/etc/my.cnf",
 			databaseUsername,
@@ -455,6 +457,7 @@ func (r *WatcherAPIReconciler) generateServiceConfigs(
 		"ServicePassword":          string(secret.Data[*instance.Spec.PasswordSelectors.Service]),
 		"ServiceUser":              *instance.Spec.ServiceUser,
 		"TransportURL":             string(secret.Data[TransportURLSelector]),
+		"QuorumQueues":             string(secret.Data[QuorumQueuesSelector]) == "true",
 		"MemcachedServers":         memcachedInstance.GetMemcachedServerListString(),
 		"MemcachedServersWithInet": memcachedInstance.GetMemcachedServerListWithInetString(),
 		"MemcachedTLS":             memcachedInstance.GetMemcachedTLSSupport(),

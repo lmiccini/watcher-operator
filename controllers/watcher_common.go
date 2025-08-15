@@ -65,6 +65,8 @@ var (
 const (
 	// TransportURLSelector is the name of key in the secret created by TransportURL
 	TransportURLSelector = "transport_url"
+	// QuorumQueuesSelector is the name of key in the secret for the quorum queues setting
+	QuorumQueuesSelector = "quorum_queues"
 	// DatabaseAccount is the name of key in the secret for the name of the Database Acount object
 	DatabaseAccount = "database_account"
 	// DatabaseUsername is the name of key in the secret for the user name used to login to the database
