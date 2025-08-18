@@ -34,6 +34,7 @@ const (
 	tlsAPIPublicField       = ".spec.tls.api.public.secretName"
 	topologyField           = ".spec.topologyRef.Name"
 	memcachedInstanceField  = ".spec.memcachedInstance"
+	transportURLSecretField = ".metadata.name" // for transportURL secret: {name}-watcher-transport
 )
 
 var (
@@ -45,6 +46,7 @@ var (
 		caBundleSecretNameField,
 		topologyField,
 		memcachedInstanceField,
+		transportURLSecretField,
 	}
 	applierWatchFields = []string{
 		passwordSecretField,
@@ -52,6 +54,7 @@ var (
 		caBundleSecretNameField,
 		topologyField,
 		memcachedInstanceField,
+		transportURLSecretField,
 	}
 	watcherWatchFields = []string{
 		passwordSecretField,
@@ -63,6 +66,7 @@ var (
 		caBundleSecretNameField,
 		topologyField,
 		memcachedInstanceField,
+		transportURLSecretField,
 	}
 )
 
@@ -71,6 +75,8 @@ const (
 	TransportURLSelector = "transport_url"
 	// NotificationURLSelector is the name of key in the secret created by the notification TransportURL
 	NotificationURLSelector = "notification_url"
+	// QuorumQueuesSelector is the name of key in the secret created by TransportURL for quorum queues enablement
+	QuorumQueuesSelector = "quorumqueues"
 	// DatabaseAccount is the name of key in the secret for the name of the Database Acount object
 	DatabaseAccount = "database_account"
 	// DatabaseUsername is the name of key in the secret for the user name used to login to the database
