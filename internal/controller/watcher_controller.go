@@ -228,6 +228,18 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherRabbitMQTransportURLReadyCondition, watcherv1beta1.WatcherRabbitMQTransportURLReadyMessage)
 
+	if err := rabbitmqv1.ManageTransportSecretFinalizer(
+		ctx, helper, instance.Namespace,
+		transportURL.Status.SecretName,
+		watcher.TransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
 	_ = op
 	// end of TransportURL creation
 
@@ -516,7 +528,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	}
 
 	// Create Watcher API
-	_, _, err = r.ensureAPI(ctx, instance, subLevelSecretName)
+	_, apiOp, err := r.ensureAPI(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 
 	if err != nil {
 		return ctrl.Result{}, err
@@ -525,7 +537,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// End of Watcher API creation
 
 	// Create Watcher DecisionEngine
-	_, _, err = r.ensureDecisionEngine(ctx, instance, subLevelSecretName)
+	_, deOp, err := r.ensureDecisionEngine(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 
 	if err != nil {
 		return ctrl.Result{}, err
@@ -534,12 +546,38 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// End of Watcher DecisionEngine creation
 
 	// Deploy Watcher Applier
-	_, _, err = r.ensureApplier(ctx, instance, subLevelSecretName)
+	_, applierOp, err := r.ensureApplier(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// End of Watcher Applier deploy
+
+	// Transport secret rotation guard: only release the old secret's
+	// consumer finalizer after all services have rolled with the new
+	// credentials. We require all sub-CR specs to be stable (no pending
+	// updates from CreateOrPatch) because the generation bump from
+	// TransportURLSecret is consumed by sub-CR controllers almost
+	// instantly, making AllSubConditionIsTrue unreliable on its own.
+	allSubCRsStable := apiOp == controllerutil.OperationResultNone &&
+		deOp == controllerutil.OperationResultNone &&
+		applierOp == controllerutil.OperationResultNone
+	isTransportRotation := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
+	if isTransportRotation {
+		if allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue() {
+			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+				ctx, helper, instance.Namespace,
+				instance.Status.TransportURLSecret,
+				watcher.TransportConsumerFinalizer,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		}
+	} else {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
 
 	// Manage the old AC secret's finalizer and status tracking.
 	// On rotation (old != new), only remove the old secret's finalizer after
@@ -548,10 +586,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 
 	if isRotation {
-		allServicesReady := instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherAPIReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherApplierReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherDecisionEngineReadyCondition)
-		if allServicesReady {
+		if allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue() {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, watcher.ACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
@@ -1058,6 +1093,7 @@ func (r *WatcherReconciler) ensureAPI(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherAPI, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherAPI '%s'", instance.Name))
@@ -1084,10 +1120,12 @@ func (r *WatcherReconciler) ensureAPI(
 			Resources:      instance.Spec.APIServiceTemplate.Resources,
 			ServiceAccount: "watcher-" + instance.Name,
 		},
-		Replicas:   instance.Spec.APIServiceTemplate.Replicas,
-		Override:   instance.Spec.APIServiceTemplate.Override,
-		TLS:        instance.Spec.APIServiceTemplate.TLS,
-		APITimeout: *instance.Spec.APITimeout,
+		Replicas:                    instance.Spec.APIServiceTemplate.Replicas,
+		Override:                    instance.Spec.APIServiceTemplate.Override,
+		TLS:                         instance.Spec.APIServiceTemplate.TLS,
+		APITimeout:                  *instance.Spec.APITimeout,
+		TransportURLSecret:          transportURLSecretName,
+		ApplicationCredentialSecret: instance.Spec.Auth.ApplicationCredentialSecret,
 	}
 
 	// If NodeSelector is not specified in Watcher APIServiceTemplate, the current
@@ -1136,6 +1174,12 @@ func (r *WatcherReconciler) ensureAPI(
 			instance.Status.Conditions.Set(c)
 		}
 		instance.Status.APIServiceReadyCount = apiDeployment.Status.ReadyCount
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			watcherv1beta1.WatcherAPIReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	return apiDeployment, op, nil
@@ -1146,6 +1190,7 @@ func (r *WatcherReconciler) ensureApplier(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherApplier, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherApplier '%s'", instance.Name))
@@ -1172,8 +1217,10 @@ func (r *WatcherReconciler) ensureApplier(
 			Resources:      instance.Spec.ApplierServiceTemplate.Resources,
 			ServiceAccount: "watcher-" + instance.Name,
 		},
-		Replicas: instance.Spec.ApplierServiceTemplate.Replicas,
-		TLS:      instance.Spec.APIServiceTemplate.TLS.Ca,
+		Replicas:                    instance.Spec.ApplierServiceTemplate.Replicas,
+		TLS:                         instance.Spec.APIServiceTemplate.TLS.Ca,
+		TransportURLSecret:          transportURLSecretName,
+		ApplicationCredentialSecret: instance.Spec.Auth.ApplicationCredentialSecret,
 	}
 
 	// If NodeSelector is not specified in Watcher ApplierServiceTemplate,
@@ -1181,6 +1228,8 @@ func (r *WatcherReconciler) ensureApplier(
 	if watcherApplierSpec.NodeSelector == nil {
 		watcherApplierSpec.NodeSelector = instance.Spec.NodeSelector
 	}
+
+	watcherApplierSpec.PrometheusSecret = instance.Spec.PrometheusSecret
 
 	applierDeployment := &watcherv1beta1.WatcherApplier{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1219,6 +1268,12 @@ func (r *WatcherReconciler) ensureApplier(
 			instance.Status.Conditions.Set(c)
 		}
 		instance.Status.ApplierServiceReadyCount = applierDeployment.Status.ReadyCount
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			watcherv1beta1.WatcherApplierReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	return applierDeployment, op, nil
@@ -1229,6 +1284,7 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherDecisionEngine, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherDecisionEngine '%s'", instance.Name))
@@ -1255,8 +1311,10 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 			Resources:      instance.Spec.DecisionEngineServiceTemplate.Resources,
 			ServiceAccount: "watcher-" + instance.Name,
 		},
-		Replicas: instance.Spec.DecisionEngineServiceTemplate.Replicas,
-		TLS:      instance.Spec.APIServiceTemplate.TLS.Ca,
+		Replicas:                    instance.Spec.DecisionEngineServiceTemplate.Replicas,
+		TLS:                         instance.Spec.APIServiceTemplate.TLS.Ca,
+		TransportURLSecret:          transportURLSecretName,
+		ApplicationCredentialSecret: instance.Spec.Auth.ApplicationCredentialSecret,
 	}
 
 	// If NodeSelector is not specified in Watcher DecisionEngineServiceTemplate, the current
@@ -1305,6 +1363,12 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 			instance.Status.Conditions.Set(c)
 		}
 		instance.Status.DecisionEngineServiceReadyCount = decisionengineDeployment.Status.ReadyCount
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			watcherv1beta1.WatcherDecisionEngineReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	return decisionengineDeployment, op, nil
@@ -1385,6 +1449,12 @@ func (r *WatcherReconciler) reconcileDelete(ctx context.Context, instance *watch
 		}
 	}
 	//
+
+	// Remove consumer finalizer from transport secret watcher was consuming.
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret, watcher.TransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Remove consumer finalizer from AC secrets watcher was consuming.
 	for _, secretName := range []string{

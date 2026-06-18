@@ -296,8 +296,13 @@ func (r *WatcherDecisionEngineReconciler) Reconcile(ctx context.Context, req ctr
 	}
 
 	result, err = r.ensureDeployment(ctx, helper, instance, prometheusSecret, inputHash, topology, memcached)
-	if err != nil {
+	if (err != nil || result != ctrl.Result{}) {
 		return result, err
+	}
+
+	if !instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		Log.Info("Waiting for the Deployment to become Ready")
+		return ctrl.Result{}, nil
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -307,6 +312,7 @@ func (r *WatcherDecisionEngineReconciler) Reconcile(ctx context.Context, req ctr
 			condition.ReadyCondition, condition.ReadyMessage)
 	}
 
+	instance.Status.ObservedGeneration = instance.Generation
 	Log.Info(fmt.Sprintf("Successfully reconciled WatcherDecisionEngine instance '%s'", instance.Name))
 	return ctrl.Result{}, nil
 }
@@ -332,9 +338,6 @@ func (r *WatcherDecisionEngineReconciler) initStatus(instance *watcherv1beta1.Wa
 	}
 
 	instance.Status.Conditions.Init(&cl)
-
-	// Update the lastObserved generation before evaluating conditions
-	instance.Status.ObservedGeneration = instance.Generation
 
 	if instance.Status.Hash == nil {
 		instance.Status.Hash = map[string]string{}

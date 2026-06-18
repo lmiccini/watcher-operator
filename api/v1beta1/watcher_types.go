@@ -62,6 +62,11 @@ type WatcherStatus struct {
 	// DecisionEngineServiceReadyCount defines the number or replicas ready from watcher-decision-engine
 	DecisionEngineServiceReadyCount int32 `json:"decisionengineServiceReadyCount,omitempty"`
 
+	// TransportURLSecret - the transport URL secret watcher is currently
+	// consuming and protecting with the openstack.org/watcher-transport-consumer
+	// finalizer.
+	TransportURLSecret string `json:"transportURLSecret,omitempty"`
+
 	// ApplicationCredentialSecret - the AC secret watcher is currently
 	// consuming and protecting with the openstack.org/watcher-ac-consumer
 	// finalizer. Tracked so the controller can remove its finalizer from the

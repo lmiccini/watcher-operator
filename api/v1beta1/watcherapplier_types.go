@@ -50,6 +50,18 @@ type WatcherApplierSpec struct {
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// TLS - Parameters related to the TLS
 	TLS tls.Ca `json:"tls,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// TransportURLSecret is the name of the secret containing the RabbitMQ
+	// transport URL. Used to trigger a generation bump during credential
+	// rotation so the parent controller can track rollout progress.
+	TransportURLSecret string `json:"transportURLSecret,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// ApplicationCredentialSecret is the name of the secret containing
+	// application credentials. Used to trigger a generation bump during
+	// credential rotation so the parent controller can track rollout progress.
+	ApplicationCredentialSecret string `json:"applicationCredentialSecret,omitempty"`
 }
 
 // WatcherApplierStatus defines the observed state of WatcherApplier

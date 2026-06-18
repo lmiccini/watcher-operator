@@ -59,6 +59,18 @@ type WatcherAPISpec struct {
 	// +kubebuilder:validation:Minimum=10
 	// APITimeout for Route and Apache
 	APITimeout int `json:"apiTimeout"`
+
+	// +kubebuilder:validation:Optional
+	// TransportURLSecret is the name of the secret containing the RabbitMQ
+	// transport URL. Used to trigger a generation bump during credential
+	// rotation so the parent controller can track rollout progress.
+	TransportURLSecret string `json:"transportURLSecret,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// ApplicationCredentialSecret is the name of the secret containing
+	// application credentials. Used to trigger a generation bump during
+	// credential rotation so the parent controller can track rollout progress.
+	ApplicationCredentialSecret string `json:"applicationCredentialSecret,omitempty"`
 }
 
 // WatcherAPIStatus defines the observed state of WatcherAPI

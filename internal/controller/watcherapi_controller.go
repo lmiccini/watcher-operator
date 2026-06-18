@@ -378,6 +378,7 @@ func (r *WatcherAPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			condition.ReadyCondition, condition.ReadyMessage)
 	}
 
+	instance.Status.ObservedGeneration = instance.Generation
 	Log.Info(fmt.Sprintf("Successfully reconciled WatcherAPI instance '%s'", instance.Name))
 	return ctrl.Result{}, nil
 }
@@ -850,9 +851,6 @@ func (r *WatcherAPIReconciler) initStatus(instance *watcherv1beta1.WatcherAPI) e
 	}
 
 	instance.Status.Conditions.Init(&cl)
-
-	// Update the lastObserved generation before evaluating conditions
-	instance.Status.ObservedGeneration = instance.Generation
 
 	if instance.Status.Hash == nil {
 		instance.Status.Hash = map[string]string{}
