@@ -553,31 +553,20 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	}
 	// End of Watcher Applier deploy
 
-	// Transport secret rotation guard: only release the old secret's
-	// consumer finalizer after all services have rolled with the new
-	// credentials. We require all sub-CR specs to be stable (no pending
-	// updates from CreateOrPatch) because the generation bump from
-	// TransportURLSecret is consumed by sub-CR controllers almost
-	// instantly, making AllSubConditionIsTrue unreliable on its own.
 	allSubCRsStable := apiOp == controllerutil.OperationResultNone &&
 		deOp == controllerutil.OperationResultNone &&
 		applierOp == controllerutil.OperationResultNone
-	isTransportRotation := instance.Status.TransportURLSecret != "" &&
-		instance.Status.TransportURLSecret != transportURL.Status.SecretName
-	if isTransportRotation {
-		if allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				instance.Status.TransportURLSecret,
-				watcher.TransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.TransportURLSecret = transportURL.Status.SecretName
-		}
-	} else {
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		watcher.TransportConsumerFinalizer,
+		allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.TransportURLSecret = secretName
 
 	// Manage the old AC secret's finalizer and status tracking.
 	// On rotation (old != new), only remove the old secret's finalizer after
