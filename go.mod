@@ -118,7 +118,7 @@ replace github.com/openstack-k8s-operators/watcher-operator/api => ./api
 
 replace github.com/openstack-k8s-operators/infra-operator/apis => github.com/lmiccini/infra-operator/apis v0.0.0-20260619053312-3890a255ab49
 
-replace github.com/openstack-k8s-operators/lib-common/modules/common => github.com/lmiccini/lib-common/modules/common v0.0.0-20260619062059-b327dcc75035
+replace github.com/openstack-k8s-operators/lib-common/modules/common => github.com/lmiccini/lib-common/modules/common v0.0.0-20260619123003-c59b288dcc9c
 
 // mschuppert: map to latest commit from release-4.18 tag
 // must consistent within modules and service operators
