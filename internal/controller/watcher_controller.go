@@ -46,6 +46,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/job"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
@@ -134,6 +135,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	serviceLabels := map[string]string{
 		common.AppSelector: watcher.ServiceName,
@@ -228,11 +230,26 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherRabbitMQTransportURLReadyCondition, watcherv1beta1.WatcherRabbitMQTransportURLReadyMessage)
 
+	// Set status early for first-time setup so PatchInstance persists it
+	// even on early returns. During rotation (old != current), the status
+	// is only updated by FinalizeSecretRotation at end of reconcile.
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
+	if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		transportURL.Status.SecretName, watcher.TransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	_ = op
 	// end of TransportURL creation
 
 	// create Notification RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 	notificationURLSecret := &corev1.Secret{}
+
+	var currentNotifSecret string
 
 	// Determine if notifications are enabled by checking NotificationsBus.Cluster
 	if instance.Spec.NotificationsBus != nil && instance.Spec.NotificationsBus.Cluster != "" {
@@ -271,6 +288,21 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 		instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherNotificationTransportURLReadyCondition, watcherv1beta1.WatcherNotificationTransportURLReadyMessage)
+
+		currentNotifSecret = notificationURL.Status.SecretName
+
+		// Set status early for first-time setup so PatchInstance persists it
+		// even on early returns. During rotation (old != current), the status
+		// is only updated by FinalizeSecretRotation at end of reconcile.
+		if instance.Status.NotificationsTransportURLSecret == "" ||
+			instance.Status.NotificationsTransportURLSecret == currentNotifSecret {
+			instance.Status.NotificationsTransportURLSecret = currentNotifSecret
+		}
+
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			currentNotifSecret, watcher.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
 
 		// Cleanup orphaned notification TransportURLs that don't match the current name
 		// This happens AFTER successful creation to avoid deleting resources if creation fails
@@ -312,6 +344,14 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		_ = op
 	} else {
 		instance.Status.Conditions.Remove(watcherv1beta1.WatcherNotificationTransportURLReadyCondition)
+
+		if instance.Status.NotificationsTransportURLSecret != "" {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+				instance.Status.NotificationsTransportURLSecret, watcher.TransportConsumerFinalizer); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		instance.Status.NotificationsTransportURLSecret = ""
 
 		// Ensure to delete all notification TransportURLs when notifications are disabled
 		transportURLList := &rabbitmqv1.TransportURLList{}
@@ -412,9 +452,8 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// The old secret's finalizer is removed later (after all services deploy)
 	// so that rapid rotations don't revoke a credential still in use by pods.
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			watcher.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.InputReadyCondition,
@@ -515,52 +554,87 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		return ctrl.Result{}, err
 	}
 
-	// Create Watcher API
-	_, _, err = r.ensureAPI(ctx, instance, subLevelSecretName)
+	rotationInProgress := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
 
+	// Create Watcher API
+	watcherAPI, apiOp, err := r.ensureAPI(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// End of Watcher API creation
+	if err := helper.EnsureFresh(ctx, apiOp, watcherAPI, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Create Watcher DecisionEngine
-	_, _, err = r.ensureDecisionEngine(ctx, instance, subLevelSecretName)
-
+	watcherDE, deOp, err := r.ensureDecisionEngine(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// End of Watcher DecisionEngine creation
+	if err := helper.EnsureFresh(ctx, deOp, watcherDE, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Deploy Watcher Applier
-	_, _, err = r.ensureApplier(ctx, instance, subLevelSecretName)
-
+	watcherApplier, applierOp, err := r.ensureApplier(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// End of Watcher Applier deploy
-
-	// Manage the old AC secret's finalizer and status tracking.
-	// On rotation (old != new), only remove the old secret's finalizer after
-	// all sub-services are ready with the new credentials. This prevents
-	// premature revocation during rapid rotations.
-	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
-
-	if isRotation {
-		allServicesReady := instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherAPIReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherApplierReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherDecisionEngineReadyCondition)
-		if allServicesReady {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
-				instance.Status.ApplicationCredentialSecret, watcher.ACConsumerFinalizer); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
-		}
-	} else if instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret {
-		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+	if err := helper.EnsureFresh(ctx, applierOp, watcherApplier, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
 	}
+
+	allSubCRsStable := apiOp == controllerutil.OperationResultNone &&
+		deOp == controllerutil.OperationResultNone &&
+		applierOp == controllerutil.OperationResultNone
+
+	// When sub-CRs were just updated, their conditions haven't been
+	// persisted yet (PatchInstance race). Requeue to let them process
+	// before evaluating the rotation guard.
+	if !allSubCRsStable {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	guardReady := condition.CredentialRotationGuardReady(
+		allSubCRsStable, &instance.Status.Conditions)
+
+	transportSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		watcher.TransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = transportSecretName
+
+	if currentNotifSecret != "" {
+		notifSecretName, err := object.FinalizeSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.NotificationsTransportURLSecret,
+			currentNotifSecret,
+			watcher.TransportConsumerFinalizer,
+			guardReady,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		instance.Status.NotificationsTransportURLSecret = notifSecretName
+	}
+
+	acSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.ApplicationCredentialSecret,
+		instance.Spec.Auth.ApplicationCredentialSecret,
+		watcher.ACConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.ApplicationCredentialSecret = acSecretName
 
 	//
 	// remove finalizers from unused MariaDBAccount records
@@ -1058,6 +1132,7 @@ func (r *WatcherReconciler) ensureAPI(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherAPI, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherAPI '%s'", instance.Name))
@@ -1108,6 +1183,10 @@ func (r *WatcherReconciler) ensureAPI(
 
 	op, err := controllerutil.CreateOrPatch(ctx, r.Client, apiDeployment, func() error {
 		apiDeployment.Spec = watcherAPISpec
+		if apiDeployment.Annotations == nil {
+			apiDeployment.Annotations = map[string]string{}
+		}
+		apiDeployment.Annotations["openstack.org/transport-url-secret"] = transportURLSecretName
 		err := controllerutil.SetControllerReference(instance, apiDeployment, r.Scheme)
 		if err != nil {
 			return err
@@ -1146,6 +1225,7 @@ func (r *WatcherReconciler) ensureApplier(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherApplier, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherApplier '%s'", instance.Name))
@@ -1182,6 +1262,8 @@ func (r *WatcherReconciler) ensureApplier(
 		watcherApplierSpec.NodeSelector = instance.Spec.NodeSelector
 	}
 
+	watcherApplierSpec.PrometheusSecret = instance.Spec.PrometheusSecret
+
 	applierDeployment := &watcherv1beta1.WatcherApplier{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-applier", instance.Name),
@@ -1191,6 +1273,10 @@ func (r *WatcherReconciler) ensureApplier(
 
 	op, err := controllerutil.CreateOrPatch(ctx, r.Client, applierDeployment, func() error {
 		applierDeployment.Spec = watcherApplierSpec
+		if applierDeployment.Annotations == nil {
+			applierDeployment.Annotations = map[string]string{}
+		}
+		applierDeployment.Annotations["openstack.org/transport-url-secret"] = transportURLSecretName
 		err := controllerutil.SetControllerReference(instance, applierDeployment, r.Scheme)
 		if err != nil {
 			return err
@@ -1229,6 +1315,7 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	transportURLSecretName string,
 ) (*watcherv1beta1.WatcherDecisionEngine, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherDecisionEngine '%s'", instance.Name))
@@ -1277,6 +1364,10 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 
 	op, err := controllerutil.CreateOrPatch(ctx, r.Client, decisionengineDeployment, func() error {
 		decisionengineDeployment.Spec = watcherDecisionEngineSpec
+		if decisionengineDeployment.Annotations == nil {
+			decisionengineDeployment.Annotations = map[string]string{}
+		}
+		decisionengineDeployment.Annotations["openstack.org/transport-url-secret"] = transportURLSecretName
 		err := controllerutil.SetControllerReference(instance, decisionengineDeployment, r.Scheme)
 		if err != nil {
 			return err
@@ -1391,8 +1482,19 @@ func (r *WatcherReconciler) reconcileDelete(ctx context.Context, instance *watch
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, watcher.ACConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Remove consumer finalizer from transport secrets watcher was consuming.
+	for _, secretName := range []string{
+		instance.Status.TransportURLSecret,
+		instance.Status.NotificationsTransportURLSecret,
+	} {
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			secretName, watcher.TransportConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
