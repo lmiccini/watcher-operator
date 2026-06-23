@@ -3,6 +3,7 @@ package functional
 import (
 	"fmt"
 	"os"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
@@ -2007,14 +2008,6 @@ var _ = Describe("Watcher controller", func() {
 					ContainElement(watcher.ACConsumerFinalizer))
 			}, timeout, interval).Should(Succeed())
 
-			// Old secret keeps the finalizer until all services deploy (split pattern)
-			secret := th.GetSecret(types.NamespacedName{
-				Namespace: watcherTest.Instance.Namespace,
-				Name:      acSecretName,
-			})
-			Expect(secret.Finalizers).To(
-				ContainElement(watcher.ACConsumerFinalizer))
-
 			// Simulate all watcher services deploying successfully
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherAPIStatefulSet)
 			keystone.SimulateKeystoneEndpointReady(watcherTest.WatcherKeystoneEndpointName)
@@ -2301,6 +2294,196 @@ var _ = Describe("Watcher controller", func() {
 				watcherv1beta1.WatcherNotificationTransportURLReadyCondition,
 				corev1.ConditionTrue,
 			)
+		})
+	})
+
+	When("TransportURL consumer finalizer is managed", func() {
+		BeforeEach(func() {
+			DeferCleanup(k8sClient.Delete, ctx,
+				CreateWatcherMessageBusSecret(
+					watcherTest.Instance.Namespace,
+					"rabbitmq-secret",
+				),
+			)
+
+			DeferCleanup(
+				k8sClient.Delete, ctx, th.CreateSecret(
+					types.NamespacedName{Namespace: watcherTest.Instance.Namespace, Name: "metric-storage-prometheus-endpoint"},
+					map[string][]byte{
+						"host": []byte("prometheus.example.com"),
+						"port": []byte("9090"),
+					},
+				))
+
+			DeferCleanup(
+				k8sClient.Delete, ctx, th.CreateSecret(
+					types.NamespacedName{Namespace: watcherTest.Instance.Namespace, Name: SecretName},
+					map[string][]byte{
+						"WatcherPassword": []byte("password"),
+					},
+				))
+
+			DeferCleanup(th.DeleteInstance, CreateWatcher(watcherTest.Instance, GetDefaultWatcherSpec()))
+			DeferCleanup(
+				mariadb.DeleteDBService,
+				mariadb.CreateDBService(
+					watcherTest.Instance.Namespace,
+					*GetWatcher(watcherTest.Instance).Spec.DatabaseInstance,
+					corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 3306}},
+					},
+				),
+			)
+			DeferCleanup(keystone.DeleteKeystoneAPI, keystone.CreateKeystoneAPI(watcherTest.WatcherAPI.Namespace))
+			memcachedSpec := memcachedv1.MemcachedSpec{
+				MemcachedSpecCore: memcachedv1.MemcachedSpecCore{
+					Replicas: ptr.To(int32(1)),
+				},
+			}
+			DeferCleanup(infra.DeleteMemcached, infra.CreateMemcached(watcherTest.Watcher.Namespace, MemcachedInstance, memcachedSpec))
+			infra.SimulateMemcachedReady(watcherTest.MemcachedNamespace)
+			mariadb.SimulateMariaDBAccountCompleted(watcherTest.WatcherDatabaseAccount)
+			mariadb.SimulateMariaDBDatabaseCompleted(watcherTest.WatcherDatabaseName)
+			infra.SimulateTransportURLReady(watcherTest.WatcherTransportURL)
+		})
+
+		It("should add the consumer finalizer to the transport secret", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      "rabbitmq-secret",
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should remove the consumer finalizer from transport secret on CR deletion", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      "rabbitmq-secret",
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				w := GetWatcher(watcherTest.Instance)
+				g.Expect(w.Status.TransportURLSecret).ToNot(BeEmpty())
+			}, timeout, interval).Should(Succeed())
+
+			th.DeleteInstance(GetWatcher(watcherTest.Instance))
+
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      "rabbitmq-secret",
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should move the finalizer from the old to the new secret on transport rotation", func() {
+			oldSecretName := "rabbitmq-secret"
+			newSecretName := "rabbitmq-secret-rotated"
+
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Get watcher to fully ready state
+			keystone.SimulateKeystoneServiceReady(watcherTest.KeystoneServiceName)
+			th.SimulateJobSuccess(watcherTest.WatcherDBSync)
+			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherAPIStatefulSet)
+			keystone.SimulateKeystoneEndpointReady(watcherTest.WatcherKeystoneEndpointName)
+			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherDecisionEngineStatefulSet)
+			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherApplierStatefulSet)
+			Eventually(func(g Gomega) {
+				w := GetWatcher(watcherTest.Instance)
+				g.Expect(w.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+				g.Expect(w.Status.TransportURLSecret).To(Equal(oldSecretName))
+			}, timeout, interval).Should(Succeed())
+
+			// Create the new rotated secret
+			newSecret := th.CreateSecret(
+				types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      newSecretName,
+				},
+				map[string][]byte{
+					"transport_url": []byte("rabbit://rotated-user:rotated-pass@rabbitmq/fake"),
+				},
+			)
+			DeferCleanup(k8sClient.Delete, ctx, newSecret)
+
+			// Simulate transport rotation
+			Eventually(func(g Gomega) {
+				transport := infra.GetTransportURL(watcherTest.WatcherTransportURL)
+				transport.Status.SecretName = newSecretName
+				g.Expect(k8sClient.Status().Update(ctx, transport)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify new secret gets the finalizer
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      newSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Old secret's finalizer should NOT be removed yet
+			Consistently(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate sub-CRs becoming ready with the new credentials
+			Eventually(func(g Gomega) {
+				th.SimulateStatefulSetReplicaReady(watcherTest.WatcherAPIStatefulSet)
+				keystone.SimulateKeystoneEndpointReady(watcherTest.WatcherKeystoneEndpointName)
+				th.SimulateStatefulSetReplicaReady(watcherTest.WatcherDecisionEngineStatefulSet)
+				th.SimulateStatefulSetReplicaReady(watcherTest.WatcherApplierStatefulSet)
+				w := GetWatcher(watcherTest.Instance)
+				if w.Annotations == nil {
+					w.Annotations = map[string]string{}
+				}
+				w.Annotations["test-reconcile-trigger"] = fmt.Sprintf("%d", time.Now().UnixNano())
+				g.Expect(k8sClient.Update(ctx, w)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Fast-forward the rotation grace period for envtest
+			Eventually(func(g Gomega) {
+				w := GetWatcher(watcherTest.Instance)
+				if w.Annotations != nil && w.Annotations["openstack.org/rotation-grace-until"] != "" {
+					w.Annotations["openstack.org/rotation-grace-until"] = time.Now().Add(-5 * time.Second).Format(time.RFC3339)
+					g.Expect(k8sClient.Update(ctx, w)).To(Succeed())
+				}
+			}, timeout, interval).Should(Succeed())
+
+			// Verify old finalizer is removed and status updated
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(watcher.TransportConsumerFinalizer))
+				w := GetWatcher(watcherTest.Instance)
+				g.Expect(w.Status.TransportURLSecret).To(Equal(newSecretName))
+			}, 10*time.Second, interval).Should(Succeed())
 		})
 	})
 
