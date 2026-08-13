@@ -2464,15 +2464,6 @@ var _ = Describe("Watcher controller", func() {
 				g.Expect(k8sClient.Update(ctx, w)).To(Succeed())
 			}, timeout, interval).Should(Succeed())
 
-			// Fast-forward the rotation grace period for envtest
-			Eventually(func(g Gomega) {
-				w := GetWatcher(watcherTest.Instance)
-				if w.Annotations != nil && w.Annotations["openstack.org/rotation-grace-until"] != "" {
-					w.Annotations["openstack.org/rotation-grace-until"] = time.Now().Add(-5 * time.Second).Format(time.RFC3339)
-					g.Expect(k8sClient.Update(ctx, w)).To(Succeed())
-				}
-			}, timeout, interval).Should(Succeed())
-
 			// Verify old finalizer is removed and status updated
 			Eventually(func(g Gomega) {
 				secret := th.GetSecret(types.NamespacedName{

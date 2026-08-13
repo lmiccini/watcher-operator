@@ -134,6 +134,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 	serviceLabels := map[string]string{
 		common.AppSelector: watcher.ServiceName,
 	}
@@ -551,24 +552,6 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		return ctrl.Result{}, err
 	}
 
-	// Create Watcher API
-	_, _, err = r.ensureAPI(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Create Watcher DecisionEngine
-	_, _, err = r.ensureDecisionEngine(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Deploy Watcher Applier
-	_, _, err = r.ensureApplier(ctx, instance, subLevelSecretName, transportURL.Status.SecretName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	rotationPending := instance.Status.TransportURLSecret != "" &&
 		instance.Status.TransportURLSecret != transportURL.Status.SecretName
 	if currentNotifSecret != "" {
@@ -576,16 +559,41 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			(instance.Status.NotificationsTransportURLSecret != "" &&
 				instance.Status.NotificationsTransportURLSecret != currentNotifSecret)
 	}
-	result, graceActive, err := object.ManageRotationGracePeriod(
-		ctx, r.Client, instance, rotationPending, 60*time.Second)
+	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
+		rotationPending = rotationPending ||
+			(instance.Status.ApplicationCredentialSecret != "" &&
+				instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret)
+	}
+
+	// Create Watcher API
+	allSubCRsStable := true
+	_, apiOp, err := r.ensureAPI(ctx, helper, instance, subLevelSecretName, transportURL.Status.SecretName, rotationPending)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if graceActive {
-		return result, nil
+	if apiOp != controllerutil.OperationResultNone {
+		allSubCRsStable = false
 	}
 
-	guardReady := condition.CredentialRotationGuardReady(true, &instance.Status.Conditions)
+	// Create Watcher DecisionEngine
+	_, deOp, err := r.ensureDecisionEngine(ctx, helper, instance, subLevelSecretName, transportURL.Status.SecretName, rotationPending)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if deOp != controllerutil.OperationResultNone {
+		allSubCRsStable = false
+	}
+
+	// Deploy Watcher Applier
+	_, applierOp, err := r.ensureApplier(ctx, helper, instance, subLevelSecretName, transportURL.Status.SecretName, rotationPending)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if applierOp != controllerutil.OperationResultNone {
+		allSubCRsStable = false
+	}
+
+	guardReady := condition.CredentialRotationGuardReady(allSubCRsStable, &instance.Status.Conditions)
 
 	transportSecretName, err := object.FinalizeSecretRotation(
 		ctx, helper, instance.Namespace,
@@ -1114,9 +1122,11 @@ func (r *WatcherReconciler) createSubLevelSecret(
 
 func (r *WatcherReconciler) ensureAPI(
 	ctx context.Context,
+	h *helper.Helper,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
 	transportURLSecretName string,
+	rotationPending bool,
 ) (*watcherv1beta1.WatcherAPI, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherAPI '%s'", instance.Name))
@@ -1190,6 +1200,9 @@ func (r *WatcherReconciler) ensureAPI(
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("WatcherAPI %s , WatcherAPI.Name %s.", string(op), apiDeployment.Name))
 	}
+	if err := object.EnsureFresh(ctx, h, apiDeployment, op, rotationPending); err != nil {
+		return nil, op, err
+	}
 
 	if apiDeployment.Generation == apiDeployment.Status.ObservedGeneration {
 		c := apiDeployment.Status.Conditions.Mirror(watcherv1beta1.WatcherAPIReadyCondition)
@@ -1207,9 +1220,11 @@ func (r *WatcherReconciler) ensureAPI(
 
 func (r *WatcherReconciler) ensureApplier(
 	ctx context.Context,
+	h *helper.Helper,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
 	transportURLSecretName string,
+	rotationPending bool,
 ) (*watcherv1beta1.WatcherApplier, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherApplier '%s'", instance.Name))
@@ -1280,6 +1295,9 @@ func (r *WatcherReconciler) ensureApplier(
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("WatcherApplier %s , WatcherApplier.Name %s.", string(op), applierDeployment.Name))
 	}
+	if err := object.EnsureFresh(ctx, h, applierDeployment, op, rotationPending); err != nil {
+		return nil, op, err
+	}
 
 	if applierDeployment.Generation == applierDeployment.Status.ObservedGeneration {
 		c := applierDeployment.Status.Conditions.Mirror(watcherv1beta1.WatcherApplierReadyCondition)
@@ -1297,9 +1315,11 @@ func (r *WatcherReconciler) ensureApplier(
 
 func (r *WatcherReconciler) ensureDecisionEngine(
 	ctx context.Context,
+	h *helper.Helper,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
 	transportURLSecretName string,
+	rotationPending bool,
 ) (*watcherv1beta1.WatcherDecisionEngine, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherDecisionEngine '%s'", instance.Name))
@@ -1370,6 +1390,9 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 	}
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("WatcherDecisionEngine %s , WatcherDecisionEngine.Name %s.", string(op), decisionengineDeployment.Name))
+	}
+	if err := object.EnsureFresh(ctx, h, decisionengineDeployment, op, rotationPending); err != nil {
+		return nil, op, err
 	}
 
 	if decisionengineDeployment.Generation == decisionengineDeployment.Status.ObservedGeneration {
