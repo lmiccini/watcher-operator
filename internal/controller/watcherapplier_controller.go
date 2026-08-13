@@ -39,6 +39,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	commonsecret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
@@ -159,7 +160,7 @@ func (r *WatcherApplierReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	configVars := make(map[string]env.Setter)
 	// check for required OpenStack secret holding passwords for service/admin user and add hash to the vars map
-	secretHash, result, secret, err := ensureSecret(
+	_, result, secret, err := ensureSecret(
 		ctx,
 		types.NamespacedName{Namespace: instance.Namespace, Name: instance.Spec.Secret},
 		[]string{
@@ -180,7 +181,11 @@ func (r *WatcherApplierReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return result, err
 	}
 
-	configVars[instance.Spec.Secret] = env.SetValue(secretHash)
+	inputSecretHash, err := commonsecret.Hash(&secret)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	configVars[instance.Spec.Secret] = env.SetValue(inputSecretHash)
 
 	// all our input checks out so report InputReady
 	instance.Status.Conditions.MarkTrue(condition.InputReadyCondition, condition.InputReadyMessage)
@@ -215,7 +220,7 @@ func (r *WatcherApplierReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// and a restart/recreate is required.
 	//
 
-	inputHash, hashChanged, errorHash := r.createHashOfInputHashes(ctx, instance, configVars)
+	inputHash, _, errorHash := r.createHashOfInputHashes(ctx, instance, configVars)
 	if errorHash != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -224,10 +229,6 @@ func (r *WatcherApplierReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			condition.ServiceConfigReadyErrorMessage,
 			errorHash.Error()))
 		return ctrl.Result{}, errorHash
-	} else if hashChanged {
-		// Hash changed and instance status should be updated (which will be done by main defer func),
-		// so we need to return and reconcile again
-		return ctrl.Result{}, nil
 	}
 
 	instance.Status.Conditions.MarkTrue(condition.ServiceConfigReadyCondition, condition.ServiceConfigReadyMessage)
@@ -258,6 +259,9 @@ func (r *WatcherApplierReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	result, err = r.ensureDeployment(ctx, helper, instance, inputHash, topology, memcached)
 	if err != nil {
 		return result, err
+	}
+	if instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition) {
+		instance.Status.AppliedInputSecretHash = inputSecretHash
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -655,7 +659,16 @@ func (r *WatcherApplierReconciler) ensureDeployment(
 		instance.Status.ReadyCount = statefulSet.Status.ReadyReplicas
 	}
 
-	if instance.Status.ReadyCount == *instance.Spec.Replicas && statefulSet.Generation == statefulSet.Status.ObservedGeneration {
+	ready := false
+	if statefulset.IsReady(statefulSet) {
+		ready, err = r.statefulSetReadyForInput(ctx, types.NamespacedName{
+			Name: statefulSet.Name, Namespace: statefulSet.Namespace,
+		}, inputHash)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if ready {
 		Log.Info("Deployment is ready")
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 	} else {

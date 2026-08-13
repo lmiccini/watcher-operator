@@ -3,11 +3,13 @@ package functional
 import (
 	"fmt"
 	"os"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
 
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	commonsecret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	//revive:disable-next-line:dot-imports
 
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
@@ -1959,7 +1961,20 @@ var _ = Describe("Watcher controller", func() {
 					ContainElement(watcher.ACConsumerFinalizer))
 			}, timeout, interval).Should(Succeed())
 
-			// Simulate all watcher services deploying successfully
+			statefulSets := []types.NamespacedName{
+				watcherTest.WatcherAPIStatefulSet,
+				watcherTest.WatcherApplierStatefulSet,
+				watcherTest.WatcherDecisionEngineStatefulSet,
+			}
+			Eventually(func(g Gomega) {
+				for _, name := range statefulSets {
+					g.Expect(GetEnvVarValue(
+						th.GetStatefulSet(name).Spec.Template.Spec.Containers[0].Env,
+						"CONFIG_HASH", "")).NotTo(BeEmpty())
+				}
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate all watcher services deploying successfully.
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherAPIStatefulSet)
 			keystone.SimulateKeystoneEndpointReady(watcherTest.WatcherKeystoneEndpointName)
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherApplierStatefulSet)
@@ -1976,6 +1991,13 @@ var _ = Describe("Watcher controller", func() {
 				condition.ReadyCondition,
 				corev1.ConditionTrue,
 			)
+
+			originalConfigHashes := map[types.NamespacedName]string{}
+			for _, name := range statefulSets {
+				originalConfigHashes[name] = GetEnvVarValue(
+					th.GetStatefulSet(name).Spec.Template.Spec.Containers[0].Env,
+					"CONFIG_HASH", "")
+			}
 
 			newACSecretName := "ac-watcher-consumer-rotated-secret" //nolint:gosec
 			newSecret := &corev1.Secret{
@@ -2007,19 +2029,63 @@ var _ = Describe("Watcher controller", func() {
 					ContainElement(watcher.ACConsumerFinalizer))
 			}, timeout, interval).Should(Succeed())
 
-			// Old secret keeps the finalizer until all services deploy (split pattern)
-			secret := th.GetSecret(types.NamespacedName{
-				Namespace: watcherTest.Instance.Namespace,
-				Name:      acSecretName,
-			})
-			Expect(secret.Finalizers).To(
-				ContainElement(watcher.ACConsumerFinalizer))
+			// Wait until the generated input Secret contains the rotated
+			// credential, then verify no child reports that revision as applied.
+			var rotatedInputHash string
+			Eventually(func(g Gomega) {
+				inputSecret := th.GetSecret(watcherTest.Watcher)
+				g.Expect(string(inputSecret.Data["ACID"])).To(Equal("rotated-ac-id"))
+				g.Expect(string(inputSecret.Data["ACSecret"])).To(Equal("rotated-ac-secret-value"))
+				hash, err := commonsecret.Hash(&inputSecret)
+				g.Expect(err).NotTo(HaveOccurred())
+				rotatedInputHash = hash
 
-			// Simulate all watcher services deploying successfully
+				g.Expect(GetWatcherAPI(watcherTest.WatcherAPI).Status.AppliedInputSecretHash).NotTo(Equal(hash))
+				g.Expect(GetWatcherApplier(watcherTest.WatcherApplier).Status.AppliedInputSecretHash).NotTo(Equal(hash))
+				g.Expect(GetWatcherDecisionEngine(watcherTest.WatcherDecisionEngine).Status.AppliedInputSecretHash).NotTo(Equal(hash))
+			}, timeout, interval).Should(Succeed())
+
+			// The parent must stop reporting Ready while its children still
+			// expose the previously applied input revision.
+			Eventually(func(g Gomega) {
+				g.Expect(GetWatcher(watcherTest.Instance).IsReady()).To(BeFalse())
+			}, timeout, interval).Should(Succeed())
+
+			// Elapsed time alone must not release the old credential.
+			Consistently(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: watcherTest.Instance.Namespace,
+					Name:      acSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(watcher.ACConsumerFinalizer))
+			}, 2*time.Second, interval).Should(Succeed())
+
+			// Synchronize on every child requesting the new workload revision
+			// before updating status for that generation.
+			Eventually(func(g Gomega) {
+				for _, name := range statefulSets {
+					currentHash := GetEnvVarValue(
+						th.GetStatefulSet(name).Spec.Template.Spec.Containers[0].Env,
+						"CONFIG_HASH", "")
+					g.Expect(currentHash).NotTo(BeEmpty())
+					g.Expect(currentHash).NotTo(Equal(originalConfigHashes[name]))
+				}
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate all watcher services deploying successfully. StatefulSet
+			// status events drive the children and their status events drive the
+			// parent; no timed or manual parent requeue is required.
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherAPIStatefulSet)
 			keystone.SimulateKeystoneEndpointReady(watcherTest.WatcherKeystoneEndpointName)
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherApplierStatefulSet)
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherDecisionEngineStatefulSet)
+
+			Eventually(func(g Gomega) {
+				g.Expect(GetWatcherAPI(watcherTest.WatcherAPI).Status.AppliedInputSecretHash).To(Equal(rotatedInputHash))
+				g.Expect(GetWatcherApplier(watcherTest.WatcherApplier).Status.AppliedInputSecretHash).To(Equal(rotatedInputHash))
+				g.Expect(GetWatcherDecisionEngine(watcherTest.WatcherDecisionEngine).Status.AppliedInputSecretHash).To(Equal(rotatedInputHash))
+			}, timeout, interval).Should(Succeed())
 
 			// Now the old secret's finalizer is removed and status updated
 			Eventually(func(g Gomega) {

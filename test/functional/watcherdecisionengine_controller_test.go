@@ -1205,15 +1205,28 @@ heartbeat_in_pthread=false`,
 			DeferCleanup(infra.DeleteMemcached, infra.CreateMemcached(watcherTest.WatcherDecisionEngine.Namespace, MemcachedInstance, memcachedSpec))
 			infra.SimulateMemcachedReady(watcherTest.MemcachedNamespace)
 
+			logger.Info("Created cinder endpoint")
+			cinderEndpoint = types.NamespacedName{Name: "cinder", Namespace: watcherTest.WatcherDecisionEngine.Namespace}
+			DeferCleanup(keystone.DeleteKeystoneEndpoint, keystone.CreateKeystoneEndpoint(cinderEndpoint))
+			keystone.SimulateKeystoneEndpointReady(cinderEndpoint)
+
 			DeferCleanup(th.DeleteInstance, CreateWatcherDecisionEngine(watcherTest.WatcherDecisionEngine, GetDefaultWatcherDecisionEngineSpec()))
 			// create watcher applier and watcher api to later check that their observed generation has not changed
 			DeferCleanup(th.DeleteInstance, CreateWatcherApplier(watcherTest.WatcherApplier, GetDefaultWatcherApplierSpec()))
 			DeferCleanup(th.DeleteInstance, CreateWatcherAPI(watcherTest.WatcherAPI, GetDefaultWatcherAPISpec()))
 
-			logger.Info("Created cinder endpoint")
-			cinderEndpoint = types.NamespacedName{Name: "cinder", Namespace: watcherTest.WatcherDecisionEngine.Namespace}
-			DeferCleanup(keystone.DeleteKeystoneEndpoint, keystone.CreateKeystoneEndpoint(cinderEndpoint))
-			keystone.SimulateKeystoneEndpointReady(cinderEndpoint)
+			statefulSets := []types.NamespacedName{
+				watcherTest.WatcherDecisionEngineStatefulSet,
+				watcherTest.WatcherApplierStatefulSet,
+				watcherTest.WatcherAPIStatefulSet,
+			}
+			Eventually(func(g Gomega) {
+				for _, name := range statefulSets {
+					g.Expect(GetEnvVarValue(
+						th.GetStatefulSet(name).Spec.Template.Spec.Containers[0].Env,
+						"CONFIG_HASH", "")).NotTo(BeEmpty())
+				}
+			}, timeout, interval).Should(Succeed())
 
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherDecisionEngineStatefulSet)
 			th.SimulateStatefulSetReplicaReady(watcherTest.WatcherApplierStatefulSet)

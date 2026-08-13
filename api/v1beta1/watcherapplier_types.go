@@ -72,6 +72,10 @@ type WatcherApplierStatus struct {
 	// Map of hashes to track e.g. job status
 	Hash map[string]string `json:"hash,omitempty"`
 
+	// AppliedInputSecretHash is the hash of the input Secret consumed by the
+	// currently ready workload.
+	AppliedInputSecretHash string `json:"appliedInputSecretHash,omitempty"`
+
 	// LastAppliedTopology - the last applied Topology
 	LastAppliedTopology *topologyv1.TopoRef `json:"lastAppliedTopology,omitempty"`
 }

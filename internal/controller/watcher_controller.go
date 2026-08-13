@@ -463,7 +463,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	// End of Prometheus config secret
 
-	subLevelSecretName, err := r.createSubLevelSecret(ctx, helper, instance, transporturlSecret, notificationURLSecret, inputSecret, db, acData)
+	subLevelSecretName, subLevelSecretHash, err := r.createSubLevelSecret(ctx, helper, instance, transporturlSecret, notificationURLSecret, inputSecret, db, acData)
 	if err != nil {
 		return ctrl.Result{}, nil
 	}
@@ -515,8 +515,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	}
 
 	// Create Watcher API
-	_, _, err = r.ensureAPI(ctx, instance, subLevelSecretName)
-
+	watcherAPI, _, err := r.ensureAPI(ctx, instance, subLevelSecretName, subLevelSecretHash)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -524,8 +523,7 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// End of Watcher API creation
 
 	// Create Watcher DecisionEngine
-	_, _, err = r.ensureDecisionEngine(ctx, instance, subLevelSecretName)
-
+	watcherDecisionEngine, _, err := r.ensureDecisionEngine(ctx, instance, subLevelSecretName, subLevelSecretHash)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -533,12 +531,21 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// End of Watcher DecisionEngine creation
 
 	// Deploy Watcher Applier
-	_, _, err = r.ensureApplier(ctx, instance, subLevelSecretName)
-
+	watcherApplier, _, err := r.ensureApplier(ctx, instance, subLevelSecretName, subLevelSecretHash)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// End of Watcher Applier deploy
+
+	allServicesReady := watcherAPI.Generation == watcherAPI.Status.ObservedGeneration &&
+		watcherAPI.Status.AppliedInputSecretHash == subLevelSecretHash &&
+		watcherAPI.IsReady() &&
+		watcherApplier.Generation == watcherApplier.Status.ObservedGeneration &&
+		watcherApplier.Status.AppliedInputSecretHash == subLevelSecretHash &&
+		watcherApplier.IsReady() &&
+		watcherDecisionEngine.Generation == watcherDecisionEngine.Status.ObservedGeneration &&
+		watcherDecisionEngine.Status.AppliedInputSecretHash == subLevelSecretHash &&
+		watcherDecisionEngine.IsReady()
 
 	// Manage the old AC secret's finalizer and status tracking.
 	// On rotation (old != new), only remove the old secret's finalizer after
@@ -547,9 +554,6 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	isRotation := instance.Status.ApplicationCredentialSecret != "" && instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 
 	if isRotation {
-		allServicesReady := instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherAPIReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherApplierReadyCondition) &&
-			instance.Status.Conditions.IsTrue(watcherv1beta1.WatcherDecisionEngineReadyCondition)
 		if allServicesReady {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, watcher.ACConsumerFinalizer); err != nil {
@@ -565,11 +569,13 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	// remove finalizers from unused MariaDBAccount records
 	// this assumes all database-depedendent deployments are up and
 	// running with current database account info
-	err = mariadbv1.DeleteUnusedMariaDBAccountFinalizers(
-		ctx, helper, watcher.DatabaseCRName,
-		*instance.Spec.DatabaseAccount, instance.Namespace)
-	if err != nil {
-		return ctrl.Result{}, err
+	if allServicesReady {
+		err = mariadbv1.DeleteUnusedMariaDBAccountFinalizers(
+			ctx, helper, watcher.DatabaseCRName,
+			*instance.Spec.DatabaseAccount, instance.Namespace)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -1006,7 +1012,7 @@ func (r *WatcherReconciler) createSubLevelSecret(
 	inputSecret corev1.Secret,
 	db *mariadbv1.Database,
 	acData *keystonev1.ApplicationCredentialData,
-) (string, error) {
+) (string, string, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating SubCr Level Secret for '%s'", instance.Name))
 	databaseAccount := db.GetAccount()
@@ -1044,14 +1050,30 @@ func (r *WatcherReconciler) createSubLevelSecret(
 	}
 
 	err := secret.EnsureSecrets(ctx, helper, instance, []util.Template{template}, nil)
+	if err != nil {
+		return secretName, "", err
+	}
 
-	return secretName, err
+	secretData := make(map[string][]byte, len(data))
+	for key, value := range data {
+		secretData[key] = []byte(value)
+	}
+	inputHash, err := secret.Hash(&corev1.Secret{
+		Data: secretData,
+		Type: corev1.SecretTypeOpaque,
+	})
+	if err != nil {
+		return secretName, "", err
+	}
+
+	return secretName, inputHash, nil
 }
 
 func (r *WatcherReconciler) ensureAPI(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	expectedInputSecretHash string,
 ) (*watcherv1beta1.WatcherAPI, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherAPI '%s'", instance.Name))
@@ -1122,7 +1144,13 @@ func (r *WatcherReconciler) ensureAPI(
 		Log.Info(fmt.Sprintf("WatcherAPI %s , WatcherAPI.Name %s.", string(op), apiDeployment.Name))
 	}
 
-	if apiDeployment.Generation == apiDeployment.Status.ObservedGeneration {
+	if apiDeployment.Generation != apiDeployment.Status.ObservedGeneration ||
+		apiDeployment.Status.AppliedInputSecretHash != expectedInputSecretHash {
+		instance.Status.Conditions.Set(condition.UnknownCondition(
+			watcherv1beta1.WatcherAPIReadyCondition,
+			condition.RequestedReason,
+			watcherv1beta1.WatcherAPIReadyRunningMessage))
+	} else {
 		c := apiDeployment.Status.Conditions.Mirror(watcherv1beta1.WatcherAPIReadyCondition)
 		// NOTE(gibi): it can be nil if the WatcherAPI CR is created but no
 		// reconciliation is run on it to initialize the ReadyCondition yet.
@@ -1140,6 +1168,7 @@ func (r *WatcherReconciler) ensureApplier(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	expectedInputSecretHash string,
 ) (*watcherv1beta1.WatcherApplier, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherApplier '%s'", instance.Name))
@@ -1205,7 +1234,13 @@ func (r *WatcherReconciler) ensureApplier(
 		Log.Info(fmt.Sprintf("WatcherApplier %s , WatcherApplier.Name %s.", string(op), applierDeployment.Name))
 	}
 
-	if applierDeployment.Generation == applierDeployment.Status.ObservedGeneration {
+	if applierDeployment.Generation != applierDeployment.Status.ObservedGeneration ||
+		applierDeployment.Status.AppliedInputSecretHash != expectedInputSecretHash {
+		instance.Status.Conditions.Set(condition.UnknownCondition(
+			watcherv1beta1.WatcherApplierReadyCondition,
+			condition.RequestedReason,
+			watcherv1beta1.WatcherApplierReadyRunningMessage))
+	} else {
 		c := applierDeployment.Status.Conditions.Mirror(watcherv1beta1.WatcherApplierReadyCondition)
 		// NOTE(gibi): it can be nil if the WatcherApplier CR is created but no
 		// reconciliation is run on it to initialize the ReadyCondition yet.
@@ -1223,6 +1258,7 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 	ctx context.Context,
 	instance *watcherv1beta1.Watcher,
 	secretName string,
+	expectedInputSecretHash string,
 ) (*watcherv1beta1.WatcherDecisionEngine, controllerutil.OperationResult, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Creating WatcherDecisionEngine '%s'", instance.Name))
@@ -1291,7 +1327,13 @@ func (r *WatcherReconciler) ensureDecisionEngine(
 		Log.Info(fmt.Sprintf("WatcherDecisionEngine %s , WatcherDecisionEngine.Name %s.", string(op), decisionengineDeployment.Name))
 	}
 
-	if decisionengineDeployment.Generation == decisionengineDeployment.Status.ObservedGeneration {
+	if decisionengineDeployment.Generation != decisionengineDeployment.Status.ObservedGeneration ||
+		decisionengineDeployment.Status.AppliedInputSecretHash != expectedInputSecretHash {
+		instance.Status.Conditions.Set(condition.UnknownCondition(
+			watcherv1beta1.WatcherDecisionEngineReadyCondition,
+			condition.RequestedReason,
+			watcherv1beta1.WatcherDecisionEngineReadyRunningMessage))
+	} else {
 		c := decisionengineDeployment.Status.Conditions.Mirror(watcherv1beta1.WatcherDecisionEngineReadyCondition)
 		// NOTE(gibi): it can be nil if the WatcherDecisionEngine CR is created but no
 		// reconciliation is run on it to initialize the ReadyCondition yet.
