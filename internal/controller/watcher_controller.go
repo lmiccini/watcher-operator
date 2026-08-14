@@ -46,6 +46,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/job"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
@@ -227,11 +228,23 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 
 	instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherRabbitMQTransportURLReadyCondition, watcherv1beta1.WatcherRabbitMQTransportURLReadyMessage)
 
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
+	if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		transportURL.Status.SecretName, watcher.TransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	_ = op
 	// end of TransportURL creation
 
 	// create Notification RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 	notificationURLSecret := &corev1.Secret{}
+
+	var currentNotifSecret string
 
 	// Determine if notifications are enabled by checking NotificationsBus.Cluster
 	if instance.Spec.NotificationsBus != nil && instance.Spec.NotificationsBus.Cluster != "" {
@@ -270,6 +283,18 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 			return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 		}
 		instance.Status.Conditions.MarkTrue(watcherv1beta1.WatcherNotificationTransportURLReadyCondition, watcherv1beta1.WatcherNotificationTransportURLReadyMessage)
+
+		currentNotifSecret = notificationURL.Status.SecretName
+
+		if instance.Status.NotificationsTransportURLSecret == "" ||
+			instance.Status.NotificationsTransportURLSecret == currentNotifSecret {
+			instance.Status.NotificationsTransportURLSecret = currentNotifSecret
+		}
+
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			currentNotifSecret, watcher.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
 
 		// Cleanup orphaned notification TransportURLs that don't match the current name
 		// This happens AFTER successful creation to avoid deleting resources if creation fails
@@ -311,6 +336,14 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		_ = op
 	} else {
 		instance.Status.Conditions.Remove(watcherv1beta1.WatcherNotificationTransportURLReadyCondition)
+
+		if instance.Status.NotificationsTransportURLSecret != "" {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+				instance.Status.NotificationsTransportURLSecret, watcher.TransportConsumerFinalizer); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		instance.Status.NotificationsTransportURLSecret = ""
 
 		// Ensure to delete all notification TransportURLs when notifications are disabled
 		transportURLList := &rabbitmqv1.TransportURLList{}
@@ -563,6 +596,32 @@ func (r *WatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 		}
 	} else if instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret {
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
+	}
+
+	transportSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		watcher.TransportConsumerFinalizer,
+		allServicesReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = transportSecretName
+
+	if currentNotifSecret != "" {
+		notifSecretName, err := object.FinalizeSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.NotificationsTransportURLSecret,
+			currentNotifSecret,
+			watcher.TransportConsumerFinalizer,
+			allServicesReady,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		instance.Status.NotificationsTransportURLSecret = notifSecretName
 	}
 
 	//
@@ -1429,6 +1488,40 @@ func (r *WatcherReconciler) reconcileDelete(ctx context.Context, instance *watch
 	} {
 		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, watcher.ACConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Remove consumer finalizer from transport secrets watcher was consuming.
+	transportSecrets := []string{
+		instance.Status.TransportURLSecret,
+		instance.Status.NotificationsTransportURLSecret,
+	}
+	tu := &rabbitmqv1.TransportURL{}
+	if err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-watcher-transport", instance.Name),
+		Namespace: instance.Namespace,
+	}, tu); err != nil {
+		if !k8s_errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	} else {
+		transportSecrets = append(transportSecrets, tu.Status.SecretName)
+	}
+	transportURLList := &rabbitmqv1.TransportURLList{}
+	if err := r.Client.List(ctx, transportURLList,
+		client.InNamespace(instance.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	notificationTransportPrefix := fmt.Sprintf("%s-watcher-notification-", instance.Name)
+	for _, url := range transportURLList.Items {
+		if strings.HasPrefix(url.Name, notificationTransportPrefix) {
+			transportSecrets = append(transportSecrets, url.Status.SecretName)
+		}
+	}
+	for _, secretName := range transportSecrets {
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			secretName, watcher.TransportConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
